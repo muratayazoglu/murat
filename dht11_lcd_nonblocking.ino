@@ -1,24 +1,34 @@
-#include <LiquidCrystal.h>          // 16x2 LCD keypad shield için kütüphane
-#include <DHT.h>                    // DHT sensör ailesi için kütüphane
-#include <stdlib.h>                 // dtostrf fonksiyonu için gerekli başlık
+#include <LiquidCrystal.h>          // 16x2 LCD keypad shield
+#include <DHT.h>                    // DHT sensor library
+#include <stdlib.h>                 // dtostrf
+#include <EEPROM.h>                 // EEPROM persistence
+#include <math.h>                   // fabs
 
-// Seri Plotter kullanılacaksa yalnızca etiketli numerik çıktılar üretmek için
-// bilgi amaçlı günlükleri kapatmaya yarayan bayrak
+#ifdef __AVR__
+  #include <avr/wdt.h>             // Watchdog for AVR boards
+#endif
+
+// ==================== Configuration Flags ====================
+// Only numeric, label-based output for Serial Plotter (no debug chatter)
 const bool ENABLE_DEBUG_LOGS = false;
 
-// ---- Donanım ayarları ----
-#define DHT_PIN 2                   // DHT sensörünün bağlı olduğu dijital pin
-#define HEATER_PIN 3                // Isıtıcıyı sürmek için çıkış pini
-#define HUMIDIFIER_PIN 11           // Nemlendiriciyi sürmek için çıkış pini (shield ile çakışmayı önlemek için D11)
-#define KEYPAD_PIN A0               // LCD keypad shield üzerindeki butonların bağlı olduğu analog pin
+// Plot preferences: use 0/1 flags for heater & humidifier on Serial Plotter
+#define PLOT_BINARY_FLAGS 1  // 1: 0/1 flags; 0: simple normalized command example
 
-#define DHT_TYPE DHT22              // Kullanılan sensör tipi (DHT22)
+// ==================== Hardware Pins ====================
+#define DHT_PIN 2                   // DHT sensor pin
+#define HEATER_PIN 3                // Heater output pin
+#define HUMIDIFIER_PIN 11           // Humidifier (latching relay pulse) pin
+#define KEYPAD_PIN A0               // LCD keypad shield buttons
 
-// LCD keypad shield: rs, en, d4, d5, d6, d7 pinleri
-LiquidCrystal lcd(8, 9, 4, 5, 6, 7);  // Shield üzerindeki sabit pin bağlantıları
-DHT dht(DHT_PIN, DHT_TYPE);           // DHT sensör nesnesi
+#define DHT_TYPE DHT22              // Using DHT22 (AM2302)
 
-// °C sembolü için özel karakter (slot 0)
+// LCD keypad shield: rs, en, d4, d5, d6, d7
+LiquidCrystal lcd(8, 9, 4, 5, 6, 7);
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// ==================== Custom Characters ====================
+// Degree symbol (slot 0)
 byte degChar[8] = {
   B00111,
   B00101,
@@ -30,50 +40,56 @@ byte degChar[8] = {
   B00000
 };
 
-// --- Zamanlama değişkenleri ---
-const unsigned long SENSOR_INTERVAL = 2000UL;     // DHT22 için önerilen minimum okuma aralığı (ms)
-const unsigned long LCD_REFRESH_INTERVAL = 200UL; // LCD ekranının yenileme periyodu (ms)
+// ==================== Timing ====================
+const unsigned long SENSOR_INTERVAL = 2000UL;     // DHT22 recommended min interval (ms)
+const unsigned long LCD_REFRESH_INTERVAL = 200UL; // LCD refresh period (ms)
 
-unsigned long lastSensorRead = 0;                 // Son sensör okuma zaman damgası
-unsigned long lastLcdRefresh = 0;                 // Son LCD güncelleme zaman damgası
+unsigned long lastSensorRead = 0;
+unsigned long lastLcdRefresh = 0;
 
-const unsigned long HUMIDIFIER_ON_PULSE = 200UL;  // Nemlendiriciyi açmak için LOW darbe süresi (ms)
-const unsigned long HUMIDIFIER_OFF_PULSE = 100UL; // Nemlendiriciyi kapatmak için LOW darbe süresi (ms)
-bool humidifierPulseActive = false;               // Nemlendirici darbesi halen sürüyor mu?
-bool humidifierPulseTargetOn = false;             // Aktif darbe açma mı kapama mı?
-unsigned long humidifierPulseStart = 0;           // Darbenin başladığı zaman damgası
+const unsigned long HUMIDIFIER_ON_PULSE  = 200UL; // ms (LOW pulse to turn ON)
+const unsigned long HUMIDIFIER_OFF_PULSE = 100UL; // ms (LOW pulse to turn OFF)
+bool humidifierPulseActive = false;
+bool humidifierPulseTargetOn = false;
+unsigned long humidifierPulseStart = 0;
 
-float lastTemperature = 0.0f;                     // Son başarılı sıcaklık ölçümü (°C)
-float lastHumidity = 0.0f;                        // Son başarılı nem ölçümü (%RH)
-bool lastReadOk = false;                          // Son sensör okumasının başarılı olup olmadığı
+// ==================== Measurements & State ====================
+float lastTemperature = 0.0f;
+float lastHumidity = 0.0f;
+bool lastReadOk = false;
 
-// --- Sıcaklık kontrol parametreleri ---
-const int TEMP_SETPOINT_DEFAULT = 25;             // Sıcaklık setpoint'inin varsayılan değeri (°C)
-int targetTempSetpoint = TEMP_SETPOINT_DEFAULT;   // Kullanıcının ayarladığı hedef sıcaklık (°C)
-const int TEMP_SETPOINT_MIN = 18;                 // Setpoint için izin verilen minimum değer
-const int TEMP_SETPOINT_MAX = 75;                 // Setpoint için izin verilen maksimum değer
-const float TEMP_HYST_ON = 0.6f;                  // Isıtıcıyı yeniden açmak için setpoint altındaki tampon
-const float TEMP_HYST_OFF = 0.2f;                 // Isıtıcıyı kapatmak için setpoint üzerindeki tampon
-const float TEMP_TREND_GAIN = 0.4f;               // Sıcaklık değişim hızına göre tamponu dinamik olarak kaydır
+bool heaterState = false;           // Directly driven via digitalWrite
+bool humidifierState = false;       // Logical latch; physical change via pulse
 
-// --- Nem kontrol parametreleri ---
-const int HUM_SETPOINT_DEFAULT = 50;              // Nem setpoint'inin varsayılan değeri (%RH)
-int targetHumSetpoint = HUM_SETPOINT_DEFAULT;     // Kullanıcının ayarladığı hedef nem (%RH)
-const int HUM_SETPOINT_MIN = 20;                  // Nem setpoint'i için izin verilen minimum değer
-const int HUM_SETPOINT_MAX = 100;                 // Nem setpoint'i için izin verilen maksimum değer
-const float HUM_HYST_ON = 2.5f;                   // Nemlendiriciyi açmak için setpoint altındaki tampon
-const float HUM_HYST_OFF = 0.7f;                  // Nemlendiriciyi kapatmak için setpoint üzerindeki tampon
-const float HUM_TREND_GAIN = 0.6f;                // Nem değişim hızına göre tamponu dinamik olarak kaydır
+float previousTemperature = NAN;
+float previousHumidity = NAN;
+float lastTemperatureSlope = 0.0f;
+float lastHumiditySlope = 0.0f;
+uint8_t consecutiveSensorFailures = 0;
 
-bool heaterState = false;                         // Isıtıcının güncel durumu
-bool humidifierState = false;                     // Nemlendiricinin beklenen (latch) durumu
-float previousTemperature = NAN;                  // Bir önceki sıcaklık ölçümü (trend analizi için)
-float previousHumidity = NAN;                     // Bir önceki nem ölçümü (trend analizi için)
-float lastTemperatureSlope = 0.0f;                // Ardışık ölçümler arasındaki sıcaklık değişimi
-float lastHumiditySlope = 0.0f;                   // Ardışık ölçümler arasındaki nem değişimi
-uint8_t consecutiveSensorFailures = 0;            // Art arda kaç sensör hatası oluştuğunu takip et
+// For Serial Plotter (0/1 flags or normalized)
+float heaterCmdPlot = 0.0f;
+float humidifierCmdPlot = 0.0f;
 
-// --- Keypad buton kodları ---
+// ==================== Temperature Control Params ====================
+const int TEMP_SETPOINT_DEFAULT = 40;   // °C
+int targetTempSetpoint = TEMP_SETPOINT_DEFAULT;
+const int TEMP_SETPOINT_MIN = 18;
+const int TEMP_SETPOINT_MAX = 75;
+const float TEMP_HYST_ON  = 0.1f;
+const float TEMP_HYST_OFF = 0.3f;
+const float TEMP_TREND_GAIN = 0.4f;
+
+// ==================== Humidity Control Params ====================
+const int HUM_SETPOINT_DEFAULT = 80;    // %RH
+int targetHumSetpoint = HUM_SETPOINT_DEFAULT;
+const int HUM_SETPOINT_MIN = 20;
+const int HUM_SETPOINT_MAX = 100;
+const float HUM_HYST_ON  = 2.5f;
+const float HUM_HYST_OFF = 0.7f;
+const float HUM_TREND_GAIN = 0.6f;
+
+// ==================== Keypad & Selection ====================
 enum Button {
   BUTTON_NONE,
   BUTTON_RIGHT,
@@ -83,298 +99,315 @@ enum Button {
   BUTTON_SELECT
 };
 
-// --- Kullanıcı girişinde hangi setpoint'in seçili olduğunu izlemek için ---
 enum SetpointSelection {
-  SELECT_TEMP,                                    // Sıcaklık setpoint'i ayarlanıyor
-  SELECT_HUM                                      // Nem setpoint'i ayarlanıyor
+  SELECT_TEMP,   // Adjust temperature setpoint
+  SELECT_HUM     // Adjust humidity setpoint
 };
+SetpointSelection activeSelection = SELECT_TEMP;
 
-SetpointSelection activeSelection = SELECT_TEMP;  // Varsayılan olarak sıcaklık setpoint'i seçili
+// Debounce for analog keypad
+const unsigned long KEY_DEBOUNCE_MS = 35UL;
+static Button stableButton = BUTTON_NONE;
+static Button lastRawButton = BUTTON_NONE;
+static unsigned long lastBounceMs = 0;
 
-// --- İleriye dönük fonksiyon bildirimleri ---
+// ==================== EEPROM Persistence ====================
+// CRC-protected compact struct
+struct Settings {
+  uint16_t magic;
+  int8_t   tempSet;
+  int8_t   humSet;
+  uint8_t  crc;
+};
+const int EE_ADDR = 0;
+const uint16_t SETTINGS_MAGIC = 0xA5C3;
+
+// Wear-friendly delayed save
+bool pendingSettingsSave = false;
+unsigned long lastSetpointEditMs = 0;
+const unsigned long SETTINGS_SAVE_DELAY = 2000UL;
+
+static uint8_t crc8(const uint8_t* d, size_t n) {
+  uint8_t c = 0x00;
+  while (n--) {
+    uint8_t x = *d++ ^ c;
+    for (uint8_t i=0; i<8; i++) x = (x & 0x80) ? (uint8_t)((x<<1) ^ 0x07) : (uint8_t)(x<<1);
+    c = x;
+  }
+  return c;
+}
+
+void loadSettings() {
+  Settings s;
+  EEPROM.get(EE_ADDR, s);
+  if (s.magic == SETTINGS_MAGIC) {
+    uint8_t calc = crc8((uint8_t*)&s, sizeof(Settings)-1);
+    if (calc == s.crc) {
+      if (s.tempSet >= TEMP_SETPOINT_MIN && s.tempSet <= TEMP_SETPOINT_MAX)
+        targetTempSetpoint = s.tempSet;
+      if (s.humSet >= HUM_SETPOINT_MIN && s.humSet <= HUM_SETPOINT_MAX)
+        targetHumSetpoint = s.humSet;
+      return;
+    }
+  }
+  // Else keep defaults
+}
+
+void saveSettingsNow() {
+  Settings s;
+  s.magic   = SETTINGS_MAGIC;
+  s.tempSet = (int8_t)targetTempSetpoint;
+  s.humSet  = (int8_t)targetHumSetpoint;
+  s.crc     = crc8((uint8_t*)&s, sizeof(Settings)-1);
+  EEPROM.put(EE_ADDR, s);
+}
+
+void scheduleSettingsSave(unsigned long now) {
+  pendingSettingsSave = true;
+  lastSetpointEditMs  = now;
+}
+
+void maybeFlushSettings(unsigned long now) {
+  if (pendingSettingsSave && (now - lastSetpointEditMs >= SETTINGS_SAVE_DELAY)) {
+    saveSettingsNow();
+    pendingSettingsSave = false;
+  }
+}
+
+// ==================== Forward Declarations ====================
 void refreshLcd();
 void controlOutputs(float temperature, float humidity, float tempSlope, float humSlope, unsigned long now);
 void printPadded2(int value);
 void printAlignedFloat(float value);
-Button readKeypadButton();
+Button readKeypadButtonRaw();
+Button readKeypadButtonDebounced(unsigned long now);
 void handleKeypad(unsigned long now);
 void updateHumidifierPulse(unsigned long now);
 void startHumidifierPulse(unsigned long now, bool turnOn);
 
+// ==================== Setup ====================
 void setup() {
-  Serial.begin(9600);                             // Seri iletişimi başlat
+#ifdef __AVR__
+  wdt_enable(WDTO_2S);   // 2s watchdog (safe for this sketch)
+#endif
 
-  pinMode(HEATER_PIN, OUTPUT);                    // Isıtıcı pinini çıkış yap
-  pinMode(HUMIDIFIER_PIN, OUTPUT);                // Nemlendirici pinini çıkış yap
-  digitalWrite(HEATER_PIN, LOW);                  // Başlangıçta ısıtıcı kapalı
-  digitalWrite(HUMIDIFIER_PIN, HIGH);             // Röle bekleme konumunda HIGH'da tutulur
+  Serial.begin(9600);
 
-  lcd.begin(16, 2);                               // LCD'yi 16x2 modunda başlat
-  lcd.createChar(0, degChar);                     // Derece sembolünü kaydet
-  lcd.clear();                                    // Başlangıç ekranını temizle
-  lcd.setCursor(0, 0);                            // İlk satırın başına git
-  lcd.print("DHT22 & LCD");                      // Kullanıcıya bilgi ver
-  lcd.setCursor(0, 1);                            // İkinci satırın başına git
-  lcd.print("Baslatiliyor...");                 // Başlatma mesajını yazdır
+  pinMode(HEATER_PIN, OUTPUT);
+  pinMode(HUMIDIFIER_PIN, OUTPUT);
+  digitalWrite(HEATER_PIN, LOW);   // heater off
+  digitalWrite(HUMIDIFIER_PIN, HIGH); // latching relay idle high
 
-  dht.begin();                                    // DHT22 sensörünü başlat
+  lcd.begin(16, 2);
+  lcd.createChar(0, degChar);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("DHT22 & LCD");
+  lcd.setCursor(0, 1);
+  lcd.print("Baslatiliyor...");
 
-  lastSensorRead = millis() - SENSOR_INTERVAL;    // İlk okumayı hemen yapabilmek için zamanlayıcıyı kaydır
-  lastLcdRefresh = millis();                      // LCD zamanlayıcısını başlangıç zamanına ayarla
+  loadSettings();       // restore setpoints if present
+  dht.begin();
+
+  lastSensorRead = millis() - SENSOR_INTERVAL; // force immediate first read
+  lastLcdRefresh = millis();
 }
 
+// ==================== Main Loop ====================
 void loop() {
-  unsigned long now = millis();                   // Döngünün başında güncel zamanı al
+  unsigned long now = millis();
 
-  handleKeypad(now);                              // Kullanıcının tuş girişlerini işle
+  handleKeypad(now);  // user input
 
-  // Sensörü yalnızca gerekli aralık geçtiğinde oku
+  // Periodic sensor read
   if (now - lastSensorRead >= SENSOR_INTERVAL) {
-    lastSensorRead = now;                         // Bir sonraki okuma için zaman damgasını güncelle
+    lastSensorRead = now;
 
-    float temperatureRaw = dht.readTemperature(); // Sensörden ham sıcaklık değerini oku
-    float humidityRaw = dht.readHumidity();       // Sensörden ham nem değerini oku
+    float temperatureRaw = dht.readTemperature();
+    float humidityRaw    = dht.readHumidity();
 
-    lastReadOk = !isnan(temperatureRaw) && !isnan(humidityRaw); // Okumanın geçerli olduğunu kontrol et
+    bool spikeIgnored = false; // do not count as failure if just a spike
+    lastReadOk = !isnan(temperatureRaw) && !isnan(humidityRaw);
 
-    if (lastReadOk) {                             // Sensör verisi geçerliyse
-      consecutiveSensorFailures = 0;              // Başarılı okuma sonrasında hata sayacını sıfırla
-      if (!isnan(previousTemperature)) {          // Trend hesabı için bir önceki sıcaklık değerini kullan
+    // Spike guard: ignore single unrealistic jumps (don't treat as failure)
+    if (lastReadOk && !isnan(previousTemperature) && !isnan(previousHumidity)) {
+      if (fabs(temperatureRaw - lastTemperature) > 10.0f ||
+          fabs(humidityRaw    - lastHumidity)    > 20.0f) {
+        if (ENABLE_DEBUG_LOGS) {
+          Serial.println(F("Spike ignored: sensor jump too large."));
+        }
+        spikeIgnored = true;
+        lastReadOk = false; // skip updates/printing this cycle
+      }
+    }
+
+    if (lastReadOk) {
+      consecutiveSensorFailures = 0;
+
+      // Trend (slope) update
+      if (!isnan(previousTemperature)) {
         lastTemperatureSlope = temperatureRaw - previousTemperature;
       } else {
         lastTemperatureSlope = 0.0f;
       }
-      if (!isnan(previousHumidity)) {             // Nem için de aynı eğilim hesabını uygula
+      if (!isnan(previousHumidity)) {
         lastHumiditySlope = humidityRaw - previousHumidity;
       } else {
         lastHumiditySlope = 0.0f;
       }
-      previousTemperature = temperatureRaw;       // Güncel değerleri bir sonraki döngü için sakla
-      previousHumidity = humidityRaw;
-      lastTemperature = temperatureRaw;           // Sıcaklık değerini kayan nokta olarak sakla (DHT22 0.1 °C çözünürlüklüdür)
-      lastHumidity = humidityRaw;                 // Nem değerini kayan nokta olarak sakla (DHT22 0.1 %RH çözünürlüklüdür)
 
-      controlOutputs(lastTemperature, lastHumidity, lastTemperatureSlope, lastHumiditySlope, now); // Update outputs using the latest readings
+      previousTemperature = temperatureRaw;
+      previousHumidity    = humidityRaw;
+      lastTemperature     = temperatureRaw;
+      lastHumidity        = humidityRaw;
 
-      Serial.print(F("Temperature:"));           // Seri porta sıcaklık etiketini yaz
-      Serial.print(lastTemperature, 1);           // Sıcaklığı tek ondalık hassasiyetle gönder
-      Serial.print(F(" Humidity:"));             // Seri porta nem etiketini yaz
-      Serial.print(lastHumidity, 1);              // Nemi tek ondalık hassasiyetle gönder
-      Serial.print(F(" Heater:"));               // Isıtıcının durumunu grafikte gösterebilmek için yazdır
-      Serial.print(heaterState ? 1 : 0);          // 1 = Açık, 0 = Kapalı
-      Serial.print(F(" Humidifier:"));           // Nemlendiricinin durumunu grafikte gösterebilmek için yazdır
-      Serial.println(humidifierState ? 1 : 0);    // 1 = Açık, 0 = Kapalı
+      controlOutputs(lastTemperature, lastHumidity, lastTemperatureSlope, lastHumiditySlope, now);
+
+      // ===== Serial Plotter: label-based 4 series =====
+      Serial.print(F("Temperature:"));
+      Serial.print(lastTemperature, 1);
+      Serial.print(F(" Humidity:"));
+      Serial.print(lastHumidity, 1);
+      Serial.print(F(" HeaterFlag:"));
+      Serial.print(heaterCmdPlot, 3);        // 0.000 or 1.000
+      Serial.print(F(" HumidifierFlag:"));
+      Serial.println(humidifierCmdPlot, 3);  // 0.000 or 1.000
     } else {
-      consecutiveSensorFailures++;                // Sensör okunamadığında ardışık hata sayısını artır
-      if (ENABLE_DEBUG_LOGS) {                    // Hata günlüğünü yalnızca debug açıkken yaz
-        Serial.print(F("DHT22 okumasi basarisiz (#"));
-        Serial.print(consecutiveSensorFailures);
-        Serial.println(F(")"));
-      }
-
-      // Hatayı gidermek için belirli aralıklarla sensörü yeniden başlatmayı dene
-      if (consecutiveSensorFailures >= 3) {
+      // Only increment failure counter if NOT a spike ignore
+      if (!spikeIgnored) {
+        consecutiveSensorFailures++;
         if (ENABLE_DEBUG_LOGS) {
-          Serial.println(F("Ardisik 3 hatadan sonra DHT yeniden baslatiliyor. Baglantilari kontrol edin."));
+          Serial.print(F("DHT22 okumasi basarisiz (#"));
+          Serial.print(consecutiveSensorFailures);
+          Serial.println(F(")"));
         }
-        dht.begin();                              // Kütüphaneyi yeniden başlat
-        consecutiveSensorFailures = 0;            // Sayaç sıfırlanır, sonraki okuma sonucu değerlendirilecek
+        if (consecutiveSensorFailures >= 3) {
+          if (ENABLE_DEBUG_LOGS) {
+            Serial.println(F("3 ardısik hata -> DHT yeniden baslatiliyor."));
+          }
+          dht.begin();
+          consecutiveSensorFailures = 0;
+        }
       }
     }
   }
 
-  updateHumidifierPulse(now);                     // Başlatılan darbenin süresi dolduysa pini serbest bırak
+  updateHumidifierPulse(now);
 
-  // LCD'yi daha sık yenilemek için bağımsız zamanlayıcı kullan
+  // LCD refresh
   if (now - lastLcdRefresh >= LCD_REFRESH_INTERVAL) {
-    lastLcdRefresh = now;                         // LCD zaman damgasını güncelle
-    refreshLcd();                                 // Ekranı güncel verilerle tazele
+    lastLcdRefresh = now;
+    refreshLcd();
   }
+
+  // EEPROM delayed save (wear-friendly)
+  maybeFlushSettings(now);
+
+#ifdef __AVR__
+  wdt_reset();  // keep watchdog happy
+#endif
 }
 
+// ==================== UI & Display ====================
 void refreshLcd() {
-  if (lastReadOk) {                               // Sensör okuması başarılıysa değerleri göster
-    consecutiveSensorFailures = 0;                // Başarılı okumada hata sayacını sıfırla
-    lcd.setCursor(0, 0);                          // Birinci satırın başına git
-    lcd.print("T:");                             // Sıcaklık etiketini yaz
-    printAlignedFloat(lastTemperature);           // Sıcaklığı tek ondalık ve hizalı yazdır
-    lcd.write(byte(0));                           // Derece sembolünü ekle
-    lcd.print('C');                               // Derece sembolünden sonra birim harfini yaz
-    lcd.print(' ');                               // Okunabilirlik için boşluk bırak
+  if (lastReadOk) {
+    consecutiveSensorFailures = 0;
+    lcd.setCursor(0, 0);
+    lcd.print("T:");
+    printAlignedFloat(lastTemperature);
+    lcd.write(byte(0));
+    lcd.print('C');
+    lcd.print(' ');
 
-    lcd.setCursor(9, 0);                          // Aynı satırda nem değerini hizalı göster
-    lcd.print("H:");                             // Nem etiketini yaz
-    printAlignedFloat(lastHumidity);              // Nem değerini tek ondalık ve hizalı yazdır
-    lcd.print('%');                               // Nem birimi olarak yüzde işaretini ekle
+    lcd.setCursor(9, 0);
+    lcd.print("H:");
+    printAlignedFloat(lastHumidity);
+    lcd.print('%');
 
-    lcd.setCursor(0, 1);                          // İkinci satırın başına git
-    lcd.print(activeSelection == SELECT_TEMP ? "T>" : "T "); // Seçili setpoint'i kısaca vurgula
-    printPadded2(targetTempSetpoint);             // Kullanıcı sıcaklık setpoint'ini yazdır
-    lcd.write(byte(0));                           // Derece sembolünü ekle
-    lcd.print('C');                               // Celsius birimini yazdır
-    lcd.print(' ');                               // Ayıraç boşluğu
+    lcd.setCursor(0, 1);
+    lcd.print(activeSelection == SELECT_TEMP ? "T>" : "T ");
+    printPadded2(targetTempSetpoint);
+    lcd.write(byte(0));
+    lcd.print('C');
+    lcd.print(' ');
 
-    lcd.print(activeSelection == SELECT_HUM ? "H>" : "H ");  // Nem setpoint'i seçiliyse vurgula
-    printPadded2(targetHumSetpoint);              // Nem setpoint'ini hizalı şekilde yazdır
-    lcd.print('%');                               // Nem birimi olarak yüzde işaretini ekle
-    lcd.print("   ");                            // Statü alanı için sağ tarafta boşluk bırak
+    lcd.print(activeSelection == SELECT_HUM ? "H>" : "H ");
+    printPadded2(targetHumSetpoint);
+    lcd.print('%');
+    lcd.print("   ");
 
-    lcd.setCursor(12, 1);                         // Satırın kalan kısmını cihaz durumunu göstermek için kullan
-    lcd.print(heaterState ? "IA" : "IK");      // Isıtıcı Açık/Kapalı durumunu göster (A=Açık, K=Kapalı)
-    lcd.setCursor(14, 1);                         // Son iki karakteri nemlendirici için ayır
-    lcd.print(humidifierState ? "NA" : "NK");  // Nemlendirici Açık/Kapalı durumunu göster (A=Açık, K=Kapalı)
-  } else {                                        // Sensör okuması başarısızsa hata mesajı göster
-    lcd.setCursor(0, 0);                          // İlk satırın başına git
-    lcd.print("DHT22 Hata!    ");               // Hata başlığını yaz ve satırı doldur
-    lcd.setCursor(0, 1);                          // İkinci satırın başına git
-
-    // Kullanıcıya öneri sağlayan, hata sayısını içeren bir mesaj göster
+    lcd.setCursor(12, 1);
+    lcd.print(heaterState ? "IA" : "IK");
+    lcd.setCursor(14, 1);
+    lcd.print(humidifierState ? "NA" : "NK");
+  } else {
+    lcd.setCursor(0, 0);
+    lcd.print("DHT22 Hata!    ");
+    lcd.setCursor(0, 1);
     lcd.print("Hata say: ");
     lcd.print(consecutiveSensorFailures);
     lcd.print("   ");
   }
 }
 
-void controlOutputs(float temperature, float humidity, float tempSlope, float humSlope, unsigned long now) {
-  float heatOnBand = TEMP_HYST_ON;                // Başlangıçta simetrik tampon kullan
-  float heatOffBand = TEMP_HYST_OFF;
-
-  if (tempSlope < -0.15f) {                       // Sıcaklık hızla düşüyorsa ısıtıcı daha erken devreye girsin
-    float boost = (-tempSlope) * TEMP_TREND_GAIN;
-    float maxBoost = TEMP_HYST_ON - TEMP_HYST_OFF; // Tamponun aşırı daralmaması için sınır
-    if (boost > maxBoost) {
-      boost = maxBoost;
-    }
-    heatOnBand = TEMP_HYST_ON - boost;
-    if (heatOnBand < TEMP_HYST_OFF) {             // Açma tamponu hiçbir zaman kapama tamponundan küçük olmasın
-      heatOnBand = TEMP_HYST_OFF;
-    }
-  }
-
-  if (tempSlope > 0.15f) {                        // Sıcaklık hızla yükseliyorsa daha erken kapat
-    float tighten = tempSlope * TEMP_TREND_GAIN;
-    if (tighten > heatOffBand - 0.05f) {          // Minimum 0.05 °C tampon bırak
-      tighten = heatOffBand - 0.05f;
-    }
-    heatOffBand = heatOffBand - tighten;
-    if (heatOffBand < 0.05f) {
-      heatOffBand = 0.05f;
-    }
-  }
-
-  float heatOnThreshold = targetTempSetpoint - heatOnBand;
-  float heatOffThreshold = targetTempSetpoint + heatOffBand;
-
-  if (temperature <= heatOnThreshold) {
-    heaterState = true;
-  } else if (temperature >= heatOffThreshold) {
-    heaterState = false;
-  }
-
-  float humOnBand = HUM_HYST_ON;                  // Nem için de asimetrik tampon uygula
-  float humOffBand = HUM_HYST_OFF;
-
-  if (humSlope < -0.3f) {                         // Nem hızla düşüyorsa yeniden açma eşiğini yükselt
-    float tighten = (-humSlope) * HUM_TREND_GAIN;
-    float maxTighten = HUM_HYST_ON - (HUM_HYST_OFF + 0.3f);
-    if (tighten > maxTighten) {
-      tighten = maxTighten;
-    }
-    humOnBand = HUM_HYST_ON - tighten;
-    if (humOnBand < HUM_HYST_OFF + 0.3f) {
-      humOnBand = HUM_HYST_OFF + 0.3f;
-    }
-  }
-
-  if (humSlope > 0.3f) {                          // Nem hızla yükseliyorsa daha erken kapat
-    float tighten = humSlope * HUM_TREND_GAIN;
-    if (tighten > humOffBand - 0.2f) {
-      tighten = humOffBand - 0.2f;
-    }
-    humOffBand = humOffBand - tighten;
-    if (humOffBand < 0.2f) {
-      humOffBand = 0.2f;
-    }
-  }
-
-  float humOnThreshold = targetHumSetpoint - humOnBand;
-  float humOffThreshold = targetHumSetpoint + humOffBand;
-
-  bool desiredHumidifierState = humidifierState;  // Mevcut durumdan başlayarak hedef durumu hesapla
-
-  if (humidity <= humOnThreshold) {
-    desiredHumidifierState = true;                // Nem düşükse nemlendiriciyi açmayı hedefle
-  } else if (humidity >= humOffThreshold) {
-    desiredHumidifierState = false;               // Nem yeterince yükseldiyse kapatmayı hedefle
-  }
-
-  if (desiredHumidifierState != humidifierState) {
-    humidifierState = desiredHumidifierState;     // Yeni durumu kaydet
-    startHumidifierPulse(now, humidifierState);   // Röleyi tetiklemek için darbe başlat
-    if (ENABLE_DEBUG_LOGS) {                      // Plotter çıktısını bozmamak için koşullu logla
-      Serial.print(F("Nemlendirici durumu: "));
-      Serial.println(humidifierState ? F("Acik") : F("Kapali"));
-    }
-  }
-
-  digitalWrite(HEATER_PIN, heaterState ? HIGH : LOW);      // Isıtıcının çıkış pinini güncelle
-}
-
 void printPadded2(int value) {
-  if (value < 10 && value >= 0) {                 // Tek haneli pozitif değerleri hizalamak için boşluk ekle
-    lcd.print(' ');
-  }
-  lcd.print(value);                               // Değeri yazdır
+  if (value < 10 && value >= 0) lcd.print(' ');
+  lcd.print(value);
 }
 
 void printAlignedFloat(float value) {
-  char buffer[8];                                  // LCD üzerinde hizalı gösterim için küçük tampon
-  dtostrf(value, 4, 1, buffer);                    // Değeri 4 karakter genişlikte ve 1 ondalıkla formatla
-  lcd.print(buffer);                               // Formatlanan sayıyı LCD'ye yazdır
+  char buffer[8];
+  dtostrf(value, 4, 1, buffer);
+  lcd.print(buffer);
 }
 
-Button readKeypadButton() {
-  int analogValue = analogRead(KEYPAD_PIN);       // Analog pin üzerinden buton değerini oku
+// ==================== Keypad Handling ====================
+Button readKeypadButtonRaw() {
+  int analogValue = analogRead(KEYPAD_PIN);
+  if (analogValue > 1000) return BUTTON_NONE;
+  else if (analogValue < 60)   return BUTTON_RIGHT;
+  else if (analogValue < 200)  return BUTTON_UP;
+  else if (analogValue < 400)  return BUTTON_DOWN;
+  else if (analogValue < 600)  return BUTTON_LEFT;
+  else if (analogValue < 800)  return BUTTON_SELECT;
+  return BUTTON_NONE;
+}
 
-  if (analogValue > 1000) {                       // 1000 üzeri değer genelde hiçbir tuşa basılmadığını gösterir
-    return BUTTON_NONE;
-  } else if (analogValue < 60) {                  // Shield üreticilerinin sağladığı tipik eşikler
-    return BUTTON_RIGHT;
-  } else if (analogValue < 200) {
-    return BUTTON_UP;
-  } else if (analogValue < 400) {
-    return BUTTON_DOWN;
-  } else if (analogValue < 600) {
-    return BUTTON_LEFT;
-  } else if (analogValue < 800) {
-    return BUTTON_SELECT;
+Button readKeypadButtonDebounced(unsigned long now) {
+  Button raw = readKeypadButtonRaw();
+  if (raw != lastRawButton) {
+    lastRawButton = raw;
+    lastBounceMs = now;
   }
-  return BUTTON_NONE;                             // Aralık dışı değerlerde güvenli dönüş
+  if (now - lastBounceMs >= KEY_DEBOUNCE_MS) {
+    stableButton = lastRawButton;
+  }
+  return stableButton;
 }
 
 void handleKeypad(unsigned long now) {
-  static Button lastButton = BUTTON_NONE;         // Önceki döngüde okunan butonu hatırla
-  Button currentButton = readKeypadButton();      // Güncel buton durumunu al
+  static Button lastButton = BUTTON_NONE;
+  Button currentButton = readKeypadButtonDebounced(now);
 
-  if (currentButton != lastButton) {              // Buton durumu değiştiyse işleme al
-    if (currentButton != BUTTON_NONE) {           // Gerçek bir butona basıldıysa
-      bool updated = false;                       // Herhangi bir setpoint değişti mi takip et
-      bool selectionChanged = false;              // Kullanıcının hangi setpoint'i ayarladığını izlemek için
+  if (currentButton != lastButton) {
+    if (currentButton != BUTTON_NONE) {
+      bool updated = false;
+      bool selectionChanged = false;
 
       switch (currentButton) {
-        case BUTTON_LEFT:                         // Sol buton: sıcaklık setpoint'ini seç
+        case BUTTON_LEFT:
           if (activeSelection != SELECT_TEMP) {
             activeSelection = SELECT_TEMP;
             selectionChanged = true;
           }
           break;
-        case BUTTON_RIGHT:                        // Sağ buton: nem setpoint'ini seç
+        case BUTTON_RIGHT:
           if (activeSelection != SELECT_HUM) {
             activeSelection = SELECT_HUM;
             selectionChanged = true;
           }
           break;
-        case BUTTON_UP:                           // Yukarı butonu: aktif setpoint'i artır
+        case BUTTON_UP:
           if (activeSelection == SELECT_TEMP) {
             if (targetTempSetpoint < TEMP_SETPOINT_MAX) {
               targetTempSetpoint++;
@@ -387,7 +420,7 @@ void handleKeypad(unsigned long now) {
             }
           }
           break;
-        case BUTTON_DOWN:                         // Aşağı butonu: aktif setpoint'i azalt
+        case BUTTON_DOWN:
           if (activeSelection == SELECT_TEMP) {
             if (targetTempSetpoint > TEMP_SETPOINT_MIN) {
               targetTempSetpoint--;
@@ -400,7 +433,7 @@ void handleKeypad(unsigned long now) {
             }
           }
           break;
-        case BUTTON_SELECT:                       // Select butonu: aktif setpoint'i varsayılan değerine döndür
+        case BUTTON_SELECT:
           if (activeSelection == SELECT_TEMP) {
             targetTempSetpoint = TEMP_SETPOINT_DEFAULT;
             updated = true;
@@ -409,52 +442,127 @@ void handleKeypad(unsigned long now) {
             updated = true;
           }
           break;
-        default:
-          break;                                  // Diğer butonlar için ek eylem gerekmez
+        default: break;
       }
 
-      if (selectionChanged) {                     // Seçim değiştiyse seri port üzerinden bildir
-        if (ENABLE_DEBUG_LOGS) {                  // Tuş geri bildirimini isteğe bağlı olarak yaz
+      if (selectionChanged) {
+        if (ENABLE_DEBUG_LOGS) {
           Serial.print(F("Ayarlanan hedef: "));
           Serial.println(activeSelection == SELECT_TEMP ? F("Sicaklik") : F("Nem"));
         }
       }
 
-      if (updated) {                              // Setpoint değiştiğinde kullanıcıyı bilgilendir
-        if (activeSelection == SELECT_TEMP) {
-          if (ENABLE_DEBUG_LOGS) {
+      if (updated) {
+        scheduleSettingsSave(now); // EEPROM save (delayed)
+        if (ENABLE_DEBUG_LOGS) {
+          if (activeSelection == SELECT_TEMP) {
             Serial.print(F("Yeni sicaklik setpoint: "));
             Serial.println(targetTempSetpoint);
-          }
-        } else {
-          if (ENABLE_DEBUG_LOGS) {
+          } else {
             Serial.print(F("Yeni nem setpoint: "));
             Serial.println(targetHumSetpoint);
           }
         }
-
-        if (lastReadOk) {                         // Güncel sensör verisi mevcutsa çıkışları yeniden değerlendir
+        if (lastReadOk) {
           controlOutputs(lastTemperature, lastHumidity, lastTemperatureSlope, lastHumiditySlope, now);
         }
       }
     }
-    lastButton = currentButton;                   // Bir sonraki döngü için güncel butonu sakla
+    lastButton = currentButton;
   }
 }
 
+// ==================== Humidifier Pulse Handling ====================
 void startHumidifierPulse(unsigned long now, bool turnOn) {
-  humidifierPulseActive = true;                   // Darbenin devam ettiğini işaretle
-  humidifierPulseTargetOn = turnOn;               // Darbenin açma mı kapama mı olduğunu sakla
-  humidifierPulseStart = now;                     // Darbenin başlangıç anını kaydet
-  digitalWrite(HUMIDIFIER_PIN, LOW);              // Darbeye LOW seviyede başlayarak röleyi tetikle
+  humidifierPulseActive = true;
+  humidifierPulseTargetOn = turnOn;
+  humidifierPulseStart = now;
+  digitalWrite(HUMIDIFIER_PIN, LOW); // start LOW pulse
 }
 
 void updateHumidifierPulse(unsigned long now) {
   if (humidifierPulseActive) {
     unsigned long pulseDuration = humidifierPulseTargetOn ? HUMIDIFIER_ON_PULSE : HUMIDIFIER_OFF_PULSE;
     if (now - humidifierPulseStart >= pulseDuration) {
-      humidifierPulseActive = false;              // Darbe süresi sona erdi
-      digitalWrite(HUMIDIFIER_PIN, HIGH);         // Röle hattını tekrar HIGH'a çekerek darbe tamamlanır
+      humidifierPulseActive = false;
+      digitalWrite(HUMIDIFIER_PIN, HIGH); // release back to idle
     }
   }
+}
+
+// ==================== Control Logic ====================
+void controlOutputs(float temperature, float humidity, float tempSlope, float humSlope, unsigned long now) {
+  // ----- Temperature: trend-aware hysteresis
+  float heatOnBand  = TEMP_HYST_ON;
+  float heatOffBand = TEMP_HYST_OFF;
+
+  if (tempSlope < -0.15f) {
+    float boost = (-tempSlope) * TEMP_TREND_GAIN;
+    float maxBoost = TEMP_HYST_ON - TEMP_HYST_OFF;
+    if (boost > maxBoost) boost = maxBoost;
+    heatOnBand = TEMP_HYST_ON - boost;
+    if (heatOnBand < TEMP_HYST_OFF) heatOnBand = TEMP_HYST_OFF;
+  }
+
+  if (tempSlope > 0.15f) {
+    float tighten = tempSlope * TEMP_TREND_GAIN;
+    if (tighten > heatOffBand - 0.05f) tighten = heatOffBand - 0.05f;
+    heatOffBand -= tighten;
+    if (heatOffBand < 0.05f) heatOffBand = 0.05f;
+  }
+
+  float heatOnThreshold  = targetTempSetpoint - heatOnBand;
+  float heatOffThreshold = targetTempSetpoint + heatOffBand;
+
+  if (temperature <= heatOnThreshold) heaterState = true;
+  else if (temperature >= heatOffThreshold) heaterState = false;
+
+  digitalWrite(HEATER_PIN, heaterState ? HIGH : LOW);
+
+  // ----- Humidity: trend-aware hysteresis with latching relay pulse
+  float humOnBand  = HUM_HYST_ON;
+  float humOffBand = HUM_HYST_OFF;
+
+  if (humSlope < -0.3f) {
+    float tighten = (-humSlope) * HUM_TREND_GAIN;
+    float maxTighten = HUM_HYST_ON - (HUM_HYST_OFF + 0.3f);
+    if (tighten > maxTighten) tighten = maxTighten;
+    humOnBand = HUM_HYST_ON - tighten;
+    if (humOnBand < HUM_HYST_OFF + 0.3f) humOnBand = HUM_HYST_OFF + 0.3f;
+  }
+
+  if (humSlope > 0.3f) {
+    float tighten = humSlope * HUM_TREND_GAIN;
+    if (tighten > humOffBand - 0.2f) tighten = humOffBand - 0.2f;
+    humOffBand -= tighten;
+    if (humOffBand < 0.2f) humOffBand = 0.2f;
+  }
+
+  float humOnThreshold  = targetHumSetpoint - humOnBand;
+  float humOffThreshold = targetHumSetpoint + humOffBand;
+
+  bool desiredHumidifierState = humidifierState;
+
+  if (humidity <= humOnThreshold) desiredHumidifierState = true;
+  else if (humidity >= humOffThreshold) desiredHumidifierState = false;
+
+  if (desiredHumidifierState != humidifierState) {
+    humidifierState = desiredHumidifierState;
+    startHumidifierPulse(now, humidifierState);
+    if (ENABLE_DEBUG_LOGS) {
+      Serial.print(F("Nemlendirici durumu: "));
+      Serial.println(humidifierState ? F("Acik") : F("Kapali"));
+    }
+  }
+
+#if PLOT_BINARY_FLAGS
+  heaterCmdPlot     = heaterState ? 1.0f : 0.0f;
+  humidifierCmdPlot = humidifierState ? 1.0f : 0.0f;
+#else
+  // Simple normalized example (customize as needed)
+  float tempErr = (float)targetTempSetpoint - temperature;
+  heaterCmdPlot     = tempErr > 0 ? 1.0f : 0.0f;
+  float humErr  = (float)targetHumSetpoint - humidity;
+  humidifierCmdPlot = humErr > 0 ? 1.0f : 0.0f;
+#endif
 }
