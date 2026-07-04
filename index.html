@@ -108,6 +108,8 @@ const forceError = (capacity, accuracyPct) => Math.abs(capacity * accuracyPct / 
 const rss = values => Math.sqrt(values.reduce((sum, value) => sum + value * value, 0));
 const sampleRange = (center, tolerance, count = 41) => tolerance <= 0 ? [center] : Array.from({ length: count }, (_, i) => center - tolerance + (2 * tolerance * i) / (count - 1));
 const unique = items => [...new Set(items)];
+const signPairs = [[-1, -1], [-1, 1], [1, -1], [1, 1]];
+const signTriples = [[-1, -1, -1], [-1, -1, 1], [-1, 1, -1], [-1, 1, 1], [1, -1, -1], [1, -1, 1], [1, 1, -1], [1, 1, 1]];
 
 const one = { x1: 0, x2: 1000, positionTolerance: 0.5, capacity: 100, accuracyPct: 0.05, weight: 60, cg: 500, cgTolerance: 20, maxError: 2 };
 const two = { x1: 0, y1: 0, x2: 1000, y2: 0, x3: 500, y3: 800, positionTolerance: 0.5, capacity: 100, accuracyPct: 0.05, weight: 60, cgx: 500, cgy: 300, cgRadialTolerance: 20, maxError: 3 };
@@ -136,22 +138,21 @@ function calculate1D(values) {
     const nominalF2 = values.weight * (actualCg - values.x1) / span;
     const nominalF1 = values.weight - nominalF2;
     if (nominalF1 < 0 || nominalF2 < 0) warnings.push(`CG ${fmt(actualCg)} mm noktasında negatif reaksiyon oluşuyor.`);
-    const cases = [
-      { f1: nominalF1 + errorKg, f2: nominalF2 - errorKg, p1: values.x1 + values.positionTolerance, p2: values.x2 - values.positionTolerance },
-      { f1: nominalF1 - errorKg, f2: nominalF2 + errorKg, p1: values.x1 - values.positionTolerance, p2: values.x2 + values.positionTolerance },
-      { f1: nominalF1 + errorKg, f2: nominalF2 + errorKg, p1: values.x1 + values.positionTolerance, p2: values.x2 + values.positionTolerance },
-      { f1: nominalF1 - errorKg, f2: nominalF2 - errorKg, p1: values.x1 - values.positionTolerance, p2: values.x2 - values.positionTolerance },
-    ];
-    for (const item of cases) {
-      const measured = (item.f1 * item.p1 + item.f2 * item.p2) / (item.f1 + item.f2);
+    for (const forceSigns of signPairs) for (const positionSigns of signPairs) {
+      const f1 = nominalF1 + forceSigns[0] * errorKg;
+      const f2 = nominalF2 + forceSigns[1] * errorKg;
+      const p1 = values.x1 + positionSigns[0] * values.positionTolerance;
+      const p2 = values.x2 + positionSigns[1] * values.positionTolerance;
+      const measured = (f1 * p1 + f2 * p2) / (f1 + f2);
       const cgError = Math.abs(measured - actualCg);
       if (cgError > worst) {
         worst = cgError;
         worstAt = actualCg;
       }
     }
-    const forcePart = (Math.abs(values.x1 - actualCg) + Math.abs(values.x2 - actualCg)) * errorKg / values.weight;
-    rssValue = Math.max(rssValue, rss([forcePart, values.positionTolerance]));
+    const forcePart = rss([(values.x1 - actualCg) * errorKg / values.weight, (values.x2 - actualCg) * errorKg / values.weight]);
+    const positionPart = rss([nominalF1 * values.positionTolerance / values.weight, nominalF2 * values.positionTolerance / values.weight]);
+    rssValue = Math.max(rssValue, rss([forcePart, positionPart]));
   }
   const nominalF2 = values.weight * (values.cg - values.x1) / span;
   return { warnings: unique(warnings), errorKg, nominalF1: values.weight - nominalF2, nominalF2, worst, rssValue, compliance: compatibility(worst, values.maxError), worstAt };
@@ -213,28 +214,28 @@ function calculate2D(values) {
     const nominal = solve3([[1, 1, 1], [points[0].x, points[1].x, points[2].x], [points[0].y, points[1].y, points[2].y]], [values.weight, values.weight * cgPoint.x, values.weight * cgPoint.y]);
     if (!nominal) continue;
     if (nominal.some(value => value < 0)) warnings.push('Bazı CG noktalarında negatif loadcell reaksiyonu oluşuyor.');
-    for (const s1 of [-1, 1]) for (const s2 of [-1, 1]) for (const s3 of [-1, 1]) {
-      const forces = [nominal[0] + s1 * errorKg, nominal[1] + s2 * errorKg, nominal[2] + s3 * errorKg];
+    for (const forceSigns of signTriples) for (const xSigns of signTriples) for (const ySigns of signTriples) {
+      const forces = nominal.map((value, i) => value + forceSigns[i] * errorKg);
       const total = forces[0] + forces[1] + forces[2];
-      for (const px of [-1, 1]) for (const py of [-1, 1]) {
-        const shifted = points.map(point => ({ x: point.x + px * values.positionTolerance, y: point.y + py * values.positionTolerance }));
-        const measuredX = forces.reduce((sum, value, i) => sum + value * shifted[i].x, 0) / total;
-        const measuredY = forces.reduce((sum, value, i) => sum + value * shifted[i].y, 0) / total;
-        const ex = Math.abs(measuredX - cgPoint.x);
-        const ey = Math.abs(measuredY - cgPoint.y);
-        const er = Math.hypot(ex, ey);
-        worstX = Math.max(worstX, ex);
-        worstY = Math.max(worstY, ey);
-        if (er > worstRadial) {
-          worstRadial = er;
-          worstAt = cgPoint;
-        }
+      const shifted = points.map((point, i) => ({ x: point.x + xSigns[i] * values.positionTolerance, y: point.y + ySigns[i] * values.positionTolerance }));
+      const measuredX = forces.reduce((sum, value, i) => sum + value * shifted[i].x, 0) / total;
+      const measuredY = forces.reduce((sum, value, i) => sum + value * shifted[i].y, 0) / total;
+      const ex = Math.abs(measuredX - cgPoint.x);
+      const ey = Math.abs(measuredY - cgPoint.y);
+      const er = Math.hypot(ex, ey);
+      worstX = Math.max(worstX, ex);
+      worstY = Math.max(worstY, ey);
+      if (er > worstRadial) {
+        worstRadial = er;
+        worstAt = cgPoint;
       }
     }
-    const forcePartX = points.reduce((sum, point) => sum + Math.abs(point.x - cgPoint.x), 0) * errorKg / values.weight;
-    const forcePartY = points.reduce((sum, point) => sum + Math.abs(point.y - cgPoint.y), 0) * errorKg / values.weight;
-    rssX = Math.max(rssX, rss([forcePartX, values.positionTolerance]));
-    rssY = Math.max(rssY, rss([forcePartY, values.positionTolerance]));
+    const forcePartX = rss(points.map(point => (point.x - cgPoint.x) * errorKg / values.weight));
+    const forcePartY = rss(points.map(point => (point.y - cgPoint.y) * errorKg / values.weight));
+    const positionPartX = rss(nominal.map(value => value * values.positionTolerance / values.weight));
+    const positionPartY = positionPartX;
+    rssX = Math.max(rssX, rss([forcePartX, positionPartX]));
+    rssY = Math.max(rssY, rss([forcePartY, positionPartY]));
   }
   const nominal = solve3([[1, 1, 1], [points[0].x, points[1].x, points[2].x], [points[0].y, points[1].y, points[2].y]], [values.weight, values.weight * values.cgx, values.weight * values.cgy]) || [NaN, NaN, NaN];
   return { warnings: unique(warnings), errorKg, nominal, worstX, worstY, worstRadial, rssX, rssY, rssRadial: Math.hypot(rssX, rssY), compliance: compatibility(worstRadial, values.maxError), worstAt };
