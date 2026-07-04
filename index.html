@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CG Hassasiyet Hesaplayıcı</title>
+  <link rel="stylesheet" href="src/styles.css" />
+</head>
+<body>
+  <main>
+    <header>
+      <p>kg · mm · %FS</p>
+      <h1>1D ve 2D CG Ölçüm Hassasiyeti Hesaplayıcı</h1>
+      <span>Worst-case ve RSS belirsizliklerini birlikte değerlendirir.</span>
+    </header>
+    <nav>
+      <button id="tab1" class="active" type="button">1D X Hesabı</button>
+      <button id="tab2" type="button">2D Hesabı</button>
+    </nav>
+    <section id="onePanel" class="panel"></section>
+    <section id="twoPanel" class="panel hidden"></section>
+  </main>
+  <script src="src/app.js"></script>
+</body>
+</html>
